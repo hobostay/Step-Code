@@ -119,6 +119,47 @@ describe("mandatory command approval", () => {
 		expect(isDangerousCommand(command)).toBe(true);
 	});
 
+	it.each([
+		"dd bs=4M if=image of=/dev/sda",
+		"dd of=/dev/sda if=/dev/zero",
+		"sudo dd of=/dev/sdb if=image bs=4M conv=fsync",
+		"git push -f origin main",
+		"git push -fu origin main",
+		"git push origin +main",
+		"git push --force-with-lease origin main",
+		"git -C repo reset --hard",
+		"git -c core.pager=cat push --force",
+		"git --git-dir=/srv/repo.git push -f",
+		"git clean -fdx",
+		"git clean --force",
+		"systemctl poweroff",
+		"systemctl halt",
+		"sudo poweroff",
+		"halt",
+		"init 0",
+		"telinit 6",
+		":> /dev/sda",
+		": > /dev/sda",
+		"sudo sh -c ':> /dev/sda'",
+	])("recognizes standard spellings of dangerous commands: %s", (command) => {
+		expect(isDangerousCommand(command)).toBe(true);
+	});
+
+	it.each([
+		"dd of=snapshot.img bs=4M",
+		"git push origin main",
+		"git push --force-if-includes origin main",
+		"git clean -dx",
+		"git reset --soft HEAD~1",
+		"git -C repo status",
+		"systemctl status",
+		"systemctl list-units",
+		"echo poweroff",
+		"x:> /dev/sda",
+	])("does not overmatch the strengthened rules: %s", (command) => {
+		expect(isDangerousCommand(command)).toBe(false);
+	});
+
 	describe.each(STEP_PERMISSION_PRESETS)("$id policy", (preset) => {
 		it.each(["run_command", "bash", "powershell"])("cannot auto-approve %s with an allow override", (toolName) => {
 			const decision = decideStepToolCall(

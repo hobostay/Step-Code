@@ -1,7 +1,8 @@
 import { inspectShellScript, type ShellInput, type ShellInvocation, type ShellWord } from "./shell-analysis.ts";
 
-const DANGEROUS_LIFECYCLE_COMMANDS = new Set(["reboot", "shutdown"]);
+const DANGEROUS_LIFECYCLE_COMMANDS = new Set(["reboot", "shutdown", "poweroff", "halt"]);
 const DANGEROUS_LIFECYCLE_SUBCOMMANDS = new Set(["init", "loginctl", "systemctl", "telinit"]);
+const DANGEROUS_RUNLEVELS = new Set(["0", "6"]);
 const COMMAND_WRAPPERS: Readonly<Record<string, readonly string[]>> = {
 	builtin: [],
 	command: [],
@@ -94,13 +95,9 @@ const COMMAND_APPROVAL_RULES: readonly CommandApprovalRule[] = [
 	{ id: "recursive-force-remove", kind: "shell", matches: isRecursiveForceRemove },
 	{ id: "system-lifecycle", kind: "shell", matches: isLifecycleCommand },
 	{ id: "format-filesystem", kind: "pattern", pattern: /\bmkfs(?:\.[\w.-]+)?\b/iu },
-	{ id: "copy-device", kind: "pattern", pattern: /\bdd\s+if=/iu },
-	{ id: "truncate-device", kind: "pattern", pattern: /\b:>\s*\/dev\//u },
-	{
-		id: "destructive-git",
-		kind: "pattern",
-		pattern: /\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]*f|push\s+[^\n]*--force(?:-with-lease)?)/iu,
-	},
+	{ id: "copy-device", kind: "shell", matches: isDeviceCopy },
+	{ id: "truncate-device", kind: "pattern", pattern: /(?:^|[^\w:]):[ \t]*>[ \t]*\/dev\//u },
+	{ id: "destructive-git", kind: "shell", matches: isDestructiveGit },
 	{ id: "destructive-sql", kind: "pattern", pattern: /\b(?:drop\s+database|truncate\s+table)\b/iu },
 ];
 
@@ -154,11 +151,58 @@ function isRecursiveForceRemove(command: ShellCommand): boolean {
 }
 
 function isLifecycleCommand(command: ShellCommand): boolean {
-	return (
-		DANGEROUS_LIFECYCLE_COMMANDS.has(command.name) ||
-		(DANGEROUS_LIFECYCLE_SUBCOMMANDS.has(command.name) &&
-			command.args.some((arg) => arg !== undefined && DANGEROUS_LIFECYCLE_COMMANDS.has(arg)))
+	if (DANGEROUS_LIFECYCLE_COMMANDS.has(command.name)) return true;
+	if (!DANGEROUS_LIFECYCLE_SUBCOMMANDS.has(command.name)) return false;
+	const dangerousRunlevel = command.name === "init" || command.name === "telinit";
+	return command.args.some(
+		(arg) =>
+			arg !== undefined &&
+			(DANGEROUS_LIFECYCLE_COMMANDS.has(arg) || (dangerousRunlevel && DANGEROUS_RUNLEVELS.has(arg))),
 	);
+}
+
+function isDeviceCopy(command: ShellCommand): boolean {
+	if (command.name !== "dd") return false;
+	return command.args.some((arg) => arg !== undefined && (arg.startsWith("if=") || arg.startsWith("of=/dev/")));
+}
+
+/** Global git options that consume the following word as their value. */
+const GIT_OPTIONS_WITH_VALUES = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"]);
+
+function isShortForceFlag(arg: string): boolean {
+	return arg.startsWith("-") && !arg.startsWith("--") && arg.slice(1).includes("f");
+}
+
+function isForcedPushArg(arg: string | undefined): boolean {
+	if (arg === undefined) return false;
+	if (arg.startsWith("+")) return true;
+	if (arg === "--force" || arg.startsWith("--force=")) return true;
+	if (arg === "--force-with-lease" || arg.startsWith("--force-with-lease=")) return true;
+	return isShortForceFlag(arg);
+}
+
+function isDestructiveGit(command: ShellCommand): boolean {
+	if (command.name !== "git") return false;
+	const args = command.args;
+	let index = 0;
+	while (index < args.length) {
+		const arg = args[index];
+		if (arg === undefined || arg === "-" || !arg.startsWith("-")) break;
+		if (arg === "--") {
+			index += 1;
+			break;
+		}
+		const separator = arg.indexOf("=");
+		const option = separator < 0 || !arg.startsWith("--") ? arg : arg.slice(0, separator);
+		index += GIT_OPTIONS_WITH_VALUES.has(option) && separator < 0 ? 2 : 1;
+	}
+	const subcommand = args[index];
+	const rest = args.slice(index + 1);
+	if (subcommand === "reset") return rest.includes("--hard");
+	if (subcommand === "clean")
+		return rest.some((arg) => arg !== undefined && (arg === "--force" || isShortForceFlag(arg)));
+	if (subcommand === "push") return rest.some(isForcedPushArg);
+	return false;
 }
 
 function collectShellCommands(command: string): {

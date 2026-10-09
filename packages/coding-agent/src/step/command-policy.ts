@@ -1,7 +1,9 @@
 import { inspectShellScript, type ShellInput, type ShellInvocation, type ShellWord } from "./shell-analysis.ts";
 
-const DANGEROUS_LIFECYCLE_COMMANDS = new Set(["reboot", "shutdown"]);
+const DANGEROUS_LIFECYCLE_COMMANDS = new Set(["halt", "poweroff", "reboot", "shutdown"]);
 const DANGEROUS_LIFECYCLE_SUBCOMMANDS = new Set(["init", "loginctl", "systemctl", "telinit"]);
+/** Runlevels that halt (0) or reboot (6) the machine when passed to init/telinit. */
+const DANGEROUS_LIFECYCLE_RUNLEVELS = new Set(["0", "6"]);
 const COMMAND_WRAPPERS: Readonly<Record<string, readonly string[]>> = {
 	builtin: [],
 	command: [],
@@ -94,14 +96,11 @@ const COMMAND_APPROVAL_RULES: readonly CommandApprovalRule[] = [
 	{ id: "recursive-force-remove", kind: "shell", matches: isRecursiveForceRemove },
 	{ id: "system-lifecycle", kind: "shell", matches: isLifecycleCommand },
 	{ id: "format-filesystem", kind: "pattern", pattern: /\bmkfs(?:\.[\w.-]+)?\b/iu },
-	{ id: "copy-device", kind: "pattern", pattern: /\bdd\b[^;&|\n]*\bif=/iu },
+	// Dangerous only when a device is on either side of the copy: dd between
+	// regular files (dd if=image of=out.img) is an ordinary file operation.
+	{ id: "copy-device", kind: "pattern", pattern: /\bdd\b[^;&|\n]*\b(?:if|of)=\/dev\//iu },
 	{ id: "truncate-device", kind: "pattern", pattern: /(?:^|[;&|]\s*):\s*>\s*\/dev\//imu },
-	{
-		id: "destructive-git",
-		kind: "pattern",
-		pattern:
-			/\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]*f|push\s+[^\n]*(?:--force(?:-with-lease(?:=\S*)?)?|-f)(?=\s|$))/iu,
-	},
+	{ id: "destructive-git", kind: "shell", matches: isDestructiveGit },
 	{ id: "destructive-sql", kind: "pattern", pattern: /\b(?:drop\s+database|truncate\s+table)\b/iu },
 ];
 
@@ -155,11 +154,94 @@ function isRecursiveForceRemove(command: ShellCommand): boolean {
 }
 
 function isLifecycleCommand(command: ShellCommand): boolean {
-	return (
-		DANGEROUS_LIFECYCLE_COMMANDS.has(command.name) ||
-		(DANGEROUS_LIFECYCLE_SUBCOMMANDS.has(command.name) &&
-			command.args.some((arg) => arg !== undefined && DANGEROUS_LIFECYCLE_COMMANDS.has(arg)))
+	if (DANGEROUS_LIFECYCLE_COMMANDS.has(command.name)) return true;
+	if (!DANGEROUS_LIFECYCLE_SUBCOMMANDS.has(command.name)) return false;
+	const runlevelCommand = command.name === "init" || command.name === "telinit";
+	return command.args.some(
+		(arg) =>
+			arg !== undefined &&
+			(DANGEROUS_LIFECYCLE_COMMANDS.has(arg) || (runlevelCommand && DANGEROUS_LIFECYCLE_RUNLEVELS.has(arg))),
 	);
+}
+
+const GIT_GLOBAL_VALUE_OPTIONS = new Set([
+	"-C",
+	"-c",
+	"--git-dir",
+	"--work-tree",
+	"--namespace",
+	"--config-env",
+	"--exec-path",
+]);
+const GIT_GLOBAL_FLAGS = new Set([
+	"-p",
+	"-P",
+	"--paginate",
+	"--no-pager",
+	"--no-replace-objects",
+	"--bare",
+	"--literal-pathspecs",
+	"--glob-pathspecs",
+	"--noglob-pathspecs",
+	"--icase-pathspecs",
+	"--html-path",
+	"--man-path",
+	"--info-path",
+]);
+
+/**
+ * Skip global options between git and its subcommand so that e.g.
+ * `git -C repo reset --hard` is classified like `git reset --hard`.
+ * Returns undefined when an unknown or dynamic option hides the subcommand.
+ */
+function gitSubcommandArgs(args: readonly (string | undefined)[]): readonly (string | undefined)[] | undefined {
+	let index = 0;
+	while (index < args.length) {
+		const arg = args[index];
+		if (arg === undefined) return undefined;
+		if (!arg.startsWith("-") || arg === "-") break;
+		const separator = arg.indexOf("=");
+		const name = separator < 0 ? arg : arg.slice(0, separator);
+		if (GIT_GLOBAL_VALUE_OPTIONS.has(name)) {
+			if (separator < 0) {
+				if (args[index + 1] === undefined) return undefined;
+				index += 1;
+			}
+		} else if (!GIT_GLOBAL_FLAGS.has(name)) {
+			return undefined;
+		}
+		index += 1;
+	}
+	return args.slice(index);
+}
+
+function isShortForceFlag(arg: string | undefined): boolean {
+	return arg !== undefined && /^-[^-]/u.test(arg) && arg.includes("f");
+}
+
+function isDestructiveGit(command: ShellCommand): boolean {
+	if (command.name !== "git") return false;
+	const args = gitSubcommandArgs(command.args);
+	if (args === undefined) return false;
+	const [subcommand, ...rest] = args;
+	const separator = rest.indexOf("--");
+	const words = separator < 0 ? rest : rest.slice(0, separator);
+	if (subcommand === "reset") return words.includes("--hard");
+	if (subcommand === "clean") return words.some((arg) => arg === "--force" || isShortForceFlag(arg));
+	if (subcommand === "push") {
+		return words.some((arg) => {
+			if (arg === undefined) return false;
+			return (
+				arg === "--force" ||
+				arg === "--force-with-lease" ||
+				arg.startsWith("--force-with-lease=") ||
+				isShortForceFlag(arg) ||
+				// +refspec forces the update without any flag: git push origin +main
+				(arg.startsWith("+") && arg.length > 1)
+			);
+		});
+	}
+	return false;
 }
 
 function collectShellCommands(command: string): {

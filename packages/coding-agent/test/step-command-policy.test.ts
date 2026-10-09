@@ -113,16 +113,52 @@ describe("mandatory command approval", () => {
 		"mkfs.ext4 /dev/test",
 		"dd if=image of=/dev/test",
 		"dd of=/dev/test if=image",
+		"dd bs=4M if=disk.img of=/dev/sda",
+		"dd if=/dev/zero of=disk.img",
 		"git reset --hard",
 		"git push -f origin main",
 		"git push origin main -f",
 		"git push --force-with-lease=main:expected origin main",
+		"git push --force-with-lease origin main",
+		"git push origin +main",
+		"git push +main:main",
+		"git -C repo reset --hard",
+		"git -c x=y push --force",
+		"git --git-dir=/repo push -f",
+		"git --no-pager -C repo clean -fd",
+		"git clean --force",
+		"sudo git push -f origin main",
 		":> /dev/test",
 		": >/dev/test",
 		"sudo reboot",
 		"sh -c 'shutdown now'",
+		"systemctl poweroff",
+		"systemctl halt",
+		"poweroff",
+		"halt",
+		"init 0",
+		"init 6",
+		"telinit 0",
 	])("preserves existing hazardous commands: %s", (command) => {
 		expect(isDangerousCommand(command)).toBe(true);
+	});
+
+	it.each([
+		"dd if=image of=out.img",
+		"dd if=image bs=4M",
+		"dd of=out.img",
+		"git push origin main",
+		"git push --force-if-includes origin main",
+		"git push origin main+topic",
+		"git clean -xdn",
+		"git reset --soft HEAD~1",
+		"git -C repo status",
+		"git -c x=y log --oneline",
+		"echo 'git push --force'",
+		"systemctl status",
+		"systemctl list-units",
+	])("does not flag benign lookalikes: %s", (command) => {
+		expect(isDangerousCommand(command)).toBe(false);
 	});
 
 	describe.each(STEP_PERMISSION_PRESETS)("$id policy", (preset) => {
